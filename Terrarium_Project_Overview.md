@@ -42,12 +42,64 @@
 
 ### Phase 1 — Core Isolation Engine (Hours 0–6)
 **Goal:** A working binary that can hatch an isolated, memory-limited process.
-- [ ] Write C++ program using `clone()` with `CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS`
-- [ ] Chroot into a prebuilt minimal Alpine rootfs
-- [ ] Exec a shell/process inside the new namespace
+- [x] Write C++ program using `clone()` with `CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS` — `src/isolate.cpp`
+- [x] Chroot into a prebuilt minimal Alpine rootfs — per-creature copy of the template via `spawn_rootfs()`
+- [x] Exec a shell/process inside the new namespace — `child_fn()`: chroot → chdir → mount `/proc` → `execlp("/bin/sh")`
 - [ ] Create a cgroup v2 directory, set `memory.max`, attach the child PID
 - [ ] Manually verify: process can't see host PIDs; process dies when it exceeds memory limit
 - **Checkpoint:** `./terrarium hatch <mem_limit_mb>` works from the CLI
+
+**Progress notes:**
+- CLI so far: `sudo ./isolate hatch <name> [mem_limit_mb]` (`mem_limit_mb` parsed but unused until cgroups land)
+- Alpine template extracted to `/root/terrarium/template`; creatures copied to `/root/terrarium/creatures/<name>`, `rm -rf`'d after exit
+- Named exit codes in `src/errors.h`
+- Env: WSL2 (Ubuntu), kernel 6.18, cgroups v2. Build: `g++ -std=c++17 -Wall -Wextra -o isolate src/isolate.cpp`
+- Not yet: `sethostname()` for the UTS demo; pipe handshake so the cgroup limit applies before `exec`
+
+---
+
+## ⏸️ SESSION HANDOFF — pick up here
+
+### What works right now (verified by hand)
+- `./isolate hatch bugsy 100` drops into an Alpine `/ #` shell inside new PID + mount + UTS namespaces.
+- **PID isolation confirmed:** `ps aux` inside shows only `sh` (PID 1) + the command run; host processes invisible.
+- **FS isolation confirmed:** `ls /` is Alpine; a file written inside (`/marker.txt`) does not appear on host; creature dir is `rm -rf`'d on exit; template stays pristine.
+- Builds clean with `-Wall -Wextra`. Runs as root (WSL default user is root).
+
+### Repo state
+- Branch `main`, **2 commits ahead of origin** (not pushed): `a4c185e` clone skeleton, `960977f` per-creature rootfs + chroot + errors.h.
+- `Terrarium_Project_Overview.md` has uncommitted edits (this handoff + Phase 1 checkboxes).
+- Files: `src/isolate.cpp` (~95 lines, all logic), `src/errors.h` (ExitCode enum). No Makefile yet.
+
+### One-time environment setup already done
+- Alpine 3.24.1 minirootfs → `/root/terrarium/template`
+- `build-essential` installed in WSL
+
+### NEXT TASK: memory cgroup (finishes Phase 1)
+In `main`, after `clone()` returns `pid`, before `waitpid`:
+1. **Check controller is delegated** (terminal, one-time):
+   `cat /sys/fs/cgroup/cgroup.subtree_control` — if no `memory`, run `echo +memory > /sys/fs/cgroup/cgroup.subtree_control`
+2. Add `write_file(path, text)` helper: `open(O_WRONLY)` → `write()` → `close()`, false on any `-1`. **Not** `fopen`/`fprintf` — cgroup files need a single `write()`.
+3. Add `setup_cgroup(pid, mem_limit_mb)`:
+   - `mkdir("/sys/fs/cgroup/terrarium-<pid>", 0755)`
+   - write `"<N>M\n"` → `<dir>/memory.max`
+   - write `"<pid>\n"` → `<dir>/cgroup.procs`
+   - return dir path (or "" on failure → new `ExitCode` in errors.h)
+4. After `waitpid`: `rmdir(dir)` (works only once the cgroup is empty, i.e. child exited).
+5. **Known race, fix after first OOM works:** child `exec`s immediately, so the limit may not be applied before it allocates. Fix = pipe handshake: child `read()`s on a pipe and blocks until parent closes the write end after `setup_cgroup`.
+
+### Then verify (Phase 1 checkpoint)
+```sh
+./isolate hatch piggy 20
+# inside the shell:
+yes | tr \\n x | head -c 100m | grep n    # or: cat /dev/zero | head -c 100m > /dev/null
+```
+Expect the process to be **OOM-killed**. Check from host: `dmesg | tail` shows an OOM kill; parent's `waitpid` status is `WIFSIGNALED` / signal 9. Print that in the parent ("creature went dormant").
+
+### After Phase 1 closes
+- Add `sethostname("terrarium")` in `child_fn` (cheap UTS demo).
+- Commit, then push the 3 commits.
+- Phase 2 starts with a **refactor**: split into `src/cgroup.{h,cpp}`, `src/container.{h,cpp}`, `src/main.cpp` + a Makefile, since the Phase 3 API links against this.
 
 ### Phase 2 — Creature Model + Persistence (Hours 6–12)
 **Goal:** Runtime state survives restarts and is queryable.
