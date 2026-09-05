@@ -1,0 +1,9 @@
+Pragya's notes
+
+1)
+memory max is important so that the creature doesn't exhaust the host's RAM and starve
+other processes (without a limit there's no memory protection between them)
+default is 64MB if it is not set in CLI
+have a file (cgroup.procs) that I write PIDs to, so the cgroup knows which PIDs come under it
+
+2) running the isolate commands creates independent isolated processes. Running commands in the CLI creates non-isolated host processes that can read all the isolated processes.

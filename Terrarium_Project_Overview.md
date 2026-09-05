@@ -45,61 +45,59 @@
 - [x] Write C++ program using `clone()` with `CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS` — `src/isolate.cpp`
 - [x] Chroot into a prebuilt minimal Alpine rootfs — per-creature copy of the template via `spawn_rootfs()`
 - [x] Exec a shell/process inside the new namespace — `child_fn()`: chroot → chdir → mount `/proc` → `execlp("/bin/sh")`
-- [ ] Create a cgroup v2 directory, set `memory.max`, attach the child PID
-- [ ] Manually verify: process can't see host PIDs; process dies when it exceeds memory limit
-- **Checkpoint:** `./terrarium hatch <mem_limit_mb>` works from the CLI
+- [x] Create a cgroup v2 directory, set `memory.max`, attach the child PID — `setup_cgroup()` + `write_file()`
+- [x] Manually verify: process can't see host PIDs; process dies when it exceeds memory limit — OOM-kill confirmed
+- **Checkpoint:** `./terrarium hatch <mem_limit_mb>` works from the CLI — ✅ done as `./isolate hatch <name> [mem_limit_mb]`
+
+**Phase 1 complete.** Verified end to end:
+- `x=x; while true; do x="$x$x"; done` inside a 20 MB creature → kernel OOM-kills it
+- `dmesg`: `Memory cgroup out of memory: Killed process ... (sh)`, `constraint=CONSTRAINT_MEMCG`, `oom_memcg=/terrarium-<pid>`
+- parent prints `creature went dormant (killed by signal 9)` via `WIFSIGNALED`
+- cgroup dir + rootfs copy cleaned up on exit
 
 **Progress notes:**
-- CLI so far: `sudo ./isolate hatch <name> [mem_limit_mb]` (`mem_limit_mb` parsed but unused until cgroups land)
-- Alpine template extracted to `/root/terrarium/template`; creatures copied to `/root/terrarium/creatures/<name>`, `rm -rf`'d after exit
-- Named exit codes in `src/errors.h`
-- Env: WSL2 (Ubuntu), kernel 6.18, cgroups v2. Build: `g++ -std=c++17 -Wall -Wextra -o isolate src/isolate.cpp`
-- Not yet: `sethostname()` for the UTS demo; pipe handshake so the cgroup limit applies before `exec`
+- CLI: `./isolate hatch <name> [mem_limit_mb]` (default 64 MB if omitted)
+- Alpine template at `/root/terrarium/template`; creatures copied to `/root/terrarium/creatures/<name>`, `rm -rf`'d after exit
+- cgroups at `/sys/fs/cgroup/terrarium-<hostpid>/`, `rmdir`'d after exit
+- Named exit codes in `src/errors.h` (through `EXIT_CGROUP = 7`)
+- Env: WSL2 (Ubuntu, root user), kernel 6.18, cgroups v2, `memory` already in `subtree_control`. Build: `g++ -std=c++17 -Wall -Wextra -o isolate src/isolate.cpp`
+- Deferred polish (non-blocking): `sethostname()` for UTS demo; pipe handshake to close the cgroup-vs-exec race; `/dev` nodes (Alpine minirootfs `/dev` is empty — no `/dev/null`, `/dev/zero`)
 
 ---
 
 ## ⏸️ SESSION HANDOFF — pick up here
 
-### What works right now (verified by hand)
-- `./isolate hatch bugsy 100` drops into an Alpine `/ #` shell inside new PID + mount + UTS namespaces.
-- **PID isolation confirmed:** `ps aux` inside shows only `sh` (PID 1) + the command run; host processes invisible.
-- **FS isolation confirmed:** `ls /` is Alpine; a file written inside (`/marker.txt`) does not appear on host; creature dir is `rm -rf`'d on exit; template stays pristine.
+### What works right now (Phase 1 complete, verified by hand)
+- `./isolate hatch <name> [mem_limit_mb]` drops into an Alpine `/ #` shell in new PID + mount + UTS namespaces, inside a memory-capped cgroup.
+- **PID isolation:** `ps aux` inside shows only `sh` (PID 1) + the command run; host processes invisible.
+- **FS isolation:** `ls /` is Alpine; a file written inside does not appear on host; creature dir `rm -rf`'d on exit; template stays pristine.
+- **Memory limit:** 20 MB creature + `x=x; while true; do x="$x$x"; done` → kernel OOM-kills it; `dmesg` shows `constraint=CONSTRAINT_MEMCG`, `oom_memcg=/terrarium-<pid>`; parent prints `creature went dormant (killed by signal 9)`.
 - Builds clean with `-Wall -Wextra`. Runs as root (WSL default user is root).
 
 ### Repo state
 - Branch `main`, **2 commits ahead of origin** (not pushed): `a4c185e` clone skeleton, `960977f` per-creature rootfs + chroot + errors.h.
-- `Terrarium_Project_Overview.md` has uncommitted edits (this handoff + Phase 1 checkboxes).
-- Files: `src/isolate.cpp` (~95 lines, all logic), `src/errors.h` (ExitCode enum). No Makefile yet.
+- Uncommitted: `src/isolate.cpp` (cgroup code), `src/errors.h` (`EXIT_CGROUP`), `notes.txt`, this MD. **Commit these next.**
+- Files: `src/isolate.cpp` (~150 lines, all logic), `src/errors.h`, `notes.txt`. No Makefile yet (`g++` by hand).
 
 ### One-time environment setup already done
 - Alpine 3.24.1 minirootfs → `/root/terrarium/template`
-- `build-essential` installed in WSL
+- `build-essential` installed in WSL; `memory` controller already in `cgroup.subtree_control`
 
-### NEXT TASK: memory cgroup (finishes Phase 1)
-In `main`, after `clone()` returns `pid`, before `waitpid`:
-1. **Check controller is delegated** (terminal, one-time):
-   `cat /sys/fs/cgroup/cgroup.subtree_control` — if no `memory`, run `echo +memory > /sys/fs/cgroup/cgroup.subtree_control`
-2. Add `write_file(path, text)` helper: `open(O_WRONLY)` → `write()` → `close()`, false on any `-1`. **Not** `fopen`/`fprintf` — cgroup files need a single `write()`.
-3. Add `setup_cgroup(pid, mem_limit_mb)`:
-   - `mkdir("/sys/fs/cgroup/terrarium-<pid>", 0755)`
-   - write `"<N>M\n"` → `<dir>/memory.max`
-   - write `"<pid>\n"` → `<dir>/cgroup.procs`
-   - return dir path (or "" on failure → new `ExitCode` in errors.h)
-4. After `waitpid`: `rmdir(dir)` (works only once the cgroup is empty, i.e. child exited).
-5. **Known race, fix after first OOM works:** child `exec`s immediately, so the limit may not be applied before it allocates. Fix = pipe handshake: child `read()`s on a pipe and blocks until parent closes the write end after `setup_cgroup`.
+### NEXT TASK: Phase 2 — Creature model + SQLite persistence
+Start with a **refactor** (the Phase 3 API links against this, so it must become a library):
+- split `isolate.cpp` → `src/cgroup.{h,cpp}`, `src/container.{h,cpp}` (spawn_rootfs + child_fn + clone/waitpid), `src/main.cpp` (arg parsing only)
+- add a `Makefile` for the multi-file build
+Then:
+1. `Creature` struct/class: `name, pid, mem_limit_mb, status (alive|dormant|released), created_at`
+2. SQLite schema `creatures(id, name, pid, mem_limit, status, created_at)`; link `-lsqlite3` (`apt install libsqlite3-dev`)
+3. `hatch` writes a row (status `alive`); on `waitpid` return, update status (`dormant` if `WIFSIGNALED`, `released` if clean exit)
+4. add `terrarium list` — read all rows, print name/status/pid
+- **Checkpoint:** hatch a creature, kill it, restart the binary, `list` still shows it with the right status
 
-### Then verify (Phase 1 checkpoint)
-```sh
-./isolate hatch piggy 20
-# inside the shell:
-yes | tr \\n x | head -c 100m | grep n    # or: cat /dev/zero | head -c 100m > /dev/null
-```
-Expect the process to be **OOM-killed**. Check from host: `dmesg | tail` shows an OOM kill; parent's `waitpid` status is `WIFSIGNALED` / signal 9. Print that in the parent ("creature went dormant").
-
-### After Phase 1 closes
-- Add `sethostname("terrarium")` in `child_fn` (cheap UTS demo).
-- Commit, then push the 3 commits.
-- Phase 2 starts with a **refactor**: split into `src/cgroup.{h,cpp}`, `src/container.{h,cpp}`, `src/main.cpp` + a Makefile, since the Phase 3 API links against this.
+### Deferred Phase 1 polish (non-blocking, do when convenient)
+- `sethostname("terrarium")` in `child_fn` — cheap UTS demo
+- pipe handshake: child `read()`s a pipe, blocks until parent closes write end after `setup_cgroup` — closes the race where the child could allocate before the limit is applied
+- `/dev` nodes: `mount tmpfs /dev` + `mknod` for `null`/`zero`/`random`/`urandom` (Alpine minirootfs `/dev` is empty; many commands need `/dev/null`)
 
 ### Phase 2 — Creature Model + Persistence (Hours 6–12)
 **Goal:** Runtime state survives restarts and is queryable.

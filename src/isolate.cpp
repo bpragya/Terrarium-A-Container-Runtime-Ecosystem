@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <fcntl.h>
+#include <signal.h>
 
 #include "errors.h"
 
@@ -33,6 +35,44 @@ static std::string spawn_rootfs(const std::string& name) {
     }
     return dst;
 }
+
+static bool write_file(const std::string& path, const std::string& text)
+{
+    int fd = open(path.c_str(), O_WRONLY);
+    if (fd == -1) 
+    { 
+        perror(("open " + path).c_str()); 
+        return false; 
+    }
+    ssize_t n = write(fd, text.c_str(), text.size());
+    close(fd);
+    if (n != (ssize_t)text.size()) 
+    { 
+        perror(("write " + path).c_str()); return false; 
+    }
+    return true;
+}
+
+// Create a cgroup for this creature, cap its memory, move the child in.
+// Returns the cgroup dir path, or "" on failure.
+static std::string setup_cgroup(pid_t pid, int mem_limit_mb) {
+    std::string dir = "/sys/fs/cgroup/terrarium-" + std::to_string(pid);
+
+    if (mkdir(dir.c_str(), 0755) == -1) 
+    { 
+        perror("mkdir cgroup"); return ""; 
+    }
+
+    if (!write_file(dir + "/memory.max", std::to_string(mem_limit_mb) + "M\n"))
+        return "";
+
+    // Moving the PID into cgroup.procs also moves its threads/children.
+    if (!write_file(dir + "/cgroup.procs", std::to_string(pid) + "\n"))
+        return "";
+
+    return dir;
+}
+
 
 static char stack[1024 * 1024];
 
@@ -82,14 +122,32 @@ int main(int argc, char* argv[]) {
     pid_t pid = clone(child_fn, stack + sizeof(stack),
                       CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | SIGCHLD,
                       &args); 
-    if (pid == -1) 
-    { 
-        perror("clone"); 
-        return EXIT_CLONE; 
+    if (pid == -1)
+    {
+        perror("clone");
+        return EXIT_CLONE;
     }
 
-    waitpid(pid, nullptr, 0);   // parent blocks until the creature exits
+    // Cap the creature's memory and move it into the cgroup.
+    int limit = (mem_limit_mb > 0) ? mem_limit_mb : 64;   // default 64 MB
+    std::string cg = setup_cgroup(pid, limit);
+    if (cg.empty())
+    {
+        kill(pid, SIGKILL);
+        waitpid(pid, nullptr, 0);
+        system(("rm -rf \"" + dst + "\"").c_str());
+        return EXIT_CGROUP;
+    }
 
-    system(("rm -rf \"" + dst + "\"").c_str());   // cleanup after the creature exits
+    int status;
+    waitpid(pid, &status, 0);   // parent blocks until the creature exits
+
+    if (WIFSIGNALED(status))
+        fprintf(stderr, "creature went dormant (killed by signal %d)\n", WTERMSIG(status));
+    else if (WIFEXITED(status))
+        fprintf(stderr, "creature exited (status %d)\n", WEXITSTATUS(status));
+
+    rmdir(cg.c_str());                            // cgroup is empty now the child is gone
+    system(("rm -rf \"" + dst + "\"").c_str());   // cleanup the rootfs copy
     return EXIT_OK;
 }
