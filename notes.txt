@@ -5,5 +5,17 @@ memory max is important so that the creature doesn't exhaust the host's RAM and 
 other processes (without a limit there's no memory protection between them)
 default is 64MB if it is not set in CLI
 have a file (cgroup.procs) that I write PIDs to, so the cgroup knows which PIDs come under it
+If the creature blows through its allocated memory, then the kernel kills its (signal 9)
 
 2) running the isolate commands creates independent isolated processes. Running commands in the CLI creates non-isolated host processes that can read all the isolated processes.
+
+
+
+sqlite3_prepare_v2 - compiles char into sqlite3_stmt obj
+
+updating the database steps
+1) sql string that stores placeholder for your values
+2) compile it into a sqlite3 object
+3) fill in the placehodler values in the object
+4) execute the statement
+5) free the object

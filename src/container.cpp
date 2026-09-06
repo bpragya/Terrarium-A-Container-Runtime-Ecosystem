@@ -12,6 +12,9 @@
 #include <string>
 
 #include "errors.h"
+#include "creatures.h"
+#include "states.h"
+
 
 static constexpr int kDefaultMemLimitMb = 64;
 
@@ -134,6 +137,22 @@ int hatch(const std::string& name, int mem_limit_mb) {
         return EXIT_CGROUP;
     }
 
+    if (!db_open("/root/terrarium/terrarium.db")) {
+        run_quiet("rm -rf \"" + dst + "\"");
+        return EXIT_DB;
+    }
+
+    int cid = creature_insert(name, limit);
+    if (cid < 0) {                           // e.g. duplicate name — abandon the hatch
+        kill(pid, SIGKILL);
+        waitpid(pid, nullptr, 0);
+        rmdir(cg.c_str());
+        db_close();
+        run_quiet("rm -rf \"" + dst + "\"");
+        return EXIT_DB;
+    }
+    creature_set_pid(cid, pid);              // fill in the pid column
+
     int status;
     waitpid(pid, &status, 0);   // parent blocks until the creature exits
 
@@ -141,6 +160,9 @@ int hatch(const std::string& name, int mem_limit_mb) {
         fprintf(stderr, "creature went dormant (killed by signal %d)\n", WTERMSIG(status));
     else if (WIFEXITED(status))
         fprintf(stderr, "creature exited (status %d)\n", WEXITSTATUS(status));
+
+    creature_set_status(cid, WIFSIGNALED(status) ? state::SLEEPING : state::RELEASED);
+    db_close();
 
     rmdir(cg.c_str());                       // cgroup is empty now the child is gone
     run_quiet("rm -rf \"" + dst + "\"");     // cleanup the rootfs copy

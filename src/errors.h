@@ -12,4 +12,5 @@ enum ExitCode {
     EXIT_CHILD_SETUP     = 5,   // chroot / chdir / mount failed in the child
     EXIT_EXEC            = 6,   // execlp() failed
     EXIT_CGROUP          = 7,   // failed to set cgroup memory limit
+    EXIT_DB              = 8,   // database open / query failed
 };

@@ -1,10 +1,12 @@
 CXX      := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2
-SRC      := src/isolate.cpp src/container.cpp
+LDLIBS   := -lsqlite3
+SRC      := src/isolate.cpp src/container.cpp src/creatures.cpp
+HDR      := src/container.h src/creatures.h src/states.h src/errors.h
 BIN      := isolate
 
-$(BIN): $(SRC) src/container.h src/errors.h
-	$(CXX) $(CXXFLAGS) -o $(BIN) $(SRC)
+$(BIN): $(SRC) $(HDR)
+	$(CXX) $(CXXFLAGS) -o $(BIN) $(SRC) $(LDLIBS)
 
 clean:
 	rm -f $(BIN)

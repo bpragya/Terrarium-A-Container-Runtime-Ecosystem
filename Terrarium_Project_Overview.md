@@ -60,7 +60,7 @@
 - Alpine template at `/root/terrarium/template`; creatures copied to `/root/terrarium/creatures/<name>`, `rm -rf`'d after exit
 - cgroups at `/sys/fs/cgroup/terrarium-<hostpid>/`, `rmdir`'d after exit
 - Named exit codes in `src/errors.h` (through `EXIT_CGROUP = 7`)
-- Env: WSL2 (Ubuntu, root user), kernel 6.18, cgroups v2, `memory` already in `subtree_control`. Build: `g++ -std=c++17 -Wall -Wextra -o isolate src/isolate.cpp`
+- Env: WSL2 (Ubuntu, root user), kernel 6.18, cgroups v2, `memory` already in `subtree_control`. Build: `make` (was raw `g++` before the refactor)
 - Deferred polish (non-blocking): `sethostname()` for UTS demo; pipe handshake to close the cgroup-vs-exec race; `/dev` nodes (Alpine minirootfs `/dev` is empty — no `/dev/null`, `/dev/zero`)
 
 ---
@@ -75,24 +75,45 @@
 - Builds clean with `-Wall -Wextra`. Runs as root (WSL default user is root).
 
 ### Repo state
-- Branch `main`, **2 commits ahead of origin** (not pushed): `a4c185e` clone skeleton, `960977f` per-creature rootfs + chroot + errors.h.
-- Uncommitted: `src/isolate.cpp` (cgroup code), `src/errors.h` (`EXIT_CGROUP`), `notes.txt`, this MD. **Commit these next.**
-- Files: `src/isolate.cpp` (~150 lines, all logic), `src/errors.h`, `notes.txt`. No Makefile yet (`g++` by hand).
+- Branch `main`, **2 commits ahead of origin** (not pushed). Recent: `7fcb83c` refactored code, `5f4e5bc` memory cgroup, `b78dd50` WIP.
+- **Refactor done:** `isolate.cpp` = `main` only; `container.{h,cpp}` = `hatch()` + spawn_rootfs/write_file/setup_cgroup/child_fn; `Makefile` builds both `.cpp` (`make`, `make clean`).
+- `errors.h` through `EXIT_CGROUP = 7`.
+- **In progress:** `src/creatures.{h,cpp}` (SQLite layer) + `src/states.h`. Staged, not committed.
 
 ### One-time environment setup already done
 - Alpine 3.24.1 minirootfs → `/root/terrarium/template`
 - `build-essential` installed in WSL; `memory` controller already in `cgroup.subtree_control`
+- **still needed:** `apt install -y libsqlite3-dev`, and add `-lsqlite3` + `src/creatures.cpp` to the Makefile
 
-### NEXT TASK: Phase 2 — Creature model + SQLite persistence
-Start with a **refactor** (the Phase 3 API links against this, so it must become a library):
-- split `isolate.cpp` → `src/cgroup.{h,cpp}`, `src/container.{h,cpp}` (spawn_rootfs + child_fn + clone/waitpid), `src/main.cpp` (arg parsing only)
-- add a `Makefile` for the multi-file build
-Then:
-1. `Creature` struct/class: `name, pid, mem_limit_mb, status (alive|dormant|released), created_at`
-2. SQLite schema `creatures(id, name, pid, mem_limit, status, created_at)`; link `-lsqlite3` (`apt install libsqlite3-dev`)
-3. `hatch` writes a row (status `alive`); on `waitpid` return, update status (`dormant` if `WIFSIGNALED`, `released` if clean exit)
-4. add `terrarium list` — read all rows, print name/status/pid
-- **Checkpoint:** hatch a creature, kill it, restart the binary, `list` still shows it with the right status
+### NEXT TASK: Phase 2 — finish the SQLite layer
+
+**Done:** `db_open(path)` (opens, runs `CREATE TABLE IF NOT EXISTS`), `db_close()`. File-scope `static sqlite3* db` shared by all `creature_*` fns.
+
+**Bugs to fix in `creatures.cpp` before it compiles/runs:**
+- `kSchema`: trailing comma after the `CHECK(...)` line → SQL syntax error. Remove it.
+- `created_at` column was dropped — re-add `created_at TEXT NOT NULL DEFAULT (datetime('now'))` if `creature_list` selects it.
+- state strings are `ALIVE`/`SLEEPING`/`RELEASED` — `creature_set_status` must write those exact strings or the `CHECK` rejects them. Keep `states.h` as the single source.
+- `creatures.h` struct: missing `;` after `}`; `enum state;` isn't valid — define the enum (or use `std::string status`); `pid_t` needs `#include <sys/types.h>`.
+- remove the stray prototypes (lines ~33–36) and `int main()` from `creatures.cpp` — `isolate.cpp` owns `main`; two `main`s won't link.
+- trim includes to `<cstdio> <string> <vector> <sqlite3.h> "creatures.h" "errors.h"`.
+
+**Still to implement (prepare / bind / step / finalize — bind params, never string-concat):**
+1. `creature_insert(name, mem_limit_mb)` → `INSERT INTO creatures(name, mem_limit) VALUES(?,?)`; return `sqlite3_last_insert_rowid(db)`; a duplicate name gives `SQLITE_CONSTRAINT` → return `-1`.
+2. `creature_set_pid(id, pid)` → `UPDATE creatures SET pid=? WHERE id=?`.
+3. `creature_set_status(id, status)` → `UPDATE creatures SET status=? WHERE id=?`.
+4. `creature_list()` → `SELECT ... ORDER BY id`; loop while `sqlite3_step == SQLITE_ROW`, read with `sqlite3_column_int/text`, push `Creature`s.
+5. add `EXIT_DB` to `errors.h`.
+
+**Then wire in (`container.cpp` `hatch()`):**
+- top: `db_open("/root/terrarium/terrarium.db")`
+- after `spawn_rootfs`: `int id = creature_insert(name, limit)` (bail on `-1`)
+- after `clone`: `creature_set_pid(id, pid)`
+- after `waitpid`: `creature_set_status(id, WIFSIGNALED(status) ? "SLEEPING" : "RELEASED")`
+- `db_close()` before return
+
+**Then `list` subcommand (`isolate.cpp`):** if `argv[1] == "list"` → `db_open`, print `creature_list()` rows, `db_close`. Relax the `argc < 3` check so `list` needs only 2 args.
+
+- **Checkpoint:** hatch `piggy` (kill it) + `bugsy` (exit cleanly), rerun binary, `./isolate list` shows `piggy=SLEEPING`, `bugsy=RELEASED`; `sqlite3 /root/terrarium/terrarium.db "select * from creatures;"` agrees.
 
 ### Deferred Phase 1 polish (non-blocking, do when convenient)
 - `sethostname("terrarium")` in `child_fn` — cheap UTS demo
