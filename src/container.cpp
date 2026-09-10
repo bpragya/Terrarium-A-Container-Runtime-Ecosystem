@@ -27,6 +27,7 @@ static void run_quiet(const std::string& cmd) {
 // Everything the cloned child needs, passed through clone()'s void* arg.
 struct ChildArgs {
     std::string rootfs;
+    std::string cmd;   // empty => interactive /bin/sh; else run via /bin/sh -c
 };
 
 // Copy the pristine Alpine template into this creature's own rootfs dir.
@@ -85,6 +86,27 @@ static std::string setup_cgroup(pid_t pid, int mem_limit_mb) {
     return dir;
 }
 
+// Read the `oom_kill` counter from a cgroup's memory.events.
+// >0 means the kernel OOM-killed at least one process in this cgroup.
+// This is how we tell "died because it blew its memory limit" from
+// "died any other way" — the exit signal can't tell them apart, since a
+// cgroup OOM and an outside `kill -9` both arrive as SIGKILL.
+static long read_oom_kill_count(const std::string& cgdir) {
+    FILE* f = fopen((cgdir + "/memory.events").c_str(), "r");
+    if (!f)
+        return 0;
+    char key[64];
+    long val = 0, oom = 0;
+    while (fscanf(f, "%63s %ld", key, &val) == 2) {
+        if (std::string(key) == "oom_kill") {
+            oom = val;
+            break;
+        }
+    }
+    fclose(f);
+    return oom;
+}
+
 static char stack[1024 * 1024];
 
 // Runs as PID 1 inside the new PID / mount / UTS namespaces.
@@ -107,17 +129,20 @@ static int child_fn(void* arg) {
         _exit(EXIT_CHILD_SETUP);
     }
 
-    execlp("/bin/sh", "sh", (char*)nullptr); // running the shell
+    if (a->cmd.empty())
+        execlp("/bin/sh", "sh", (char*)nullptr);            // interactive shell
+    else
+        execlp("/bin/sh", "sh", "-c", a->cmd.c_str(), (char*)nullptr); // run the given command
     perror("execlp");   // only reached if exec failed
     _exit(EXIT_EXEC);
 }
 
-int hatch(const std::string& name, int mem_limit_mb) {
+int hatch(const std::string& name, int mem_limit_mb, const std::string& cmd) {
     std::string dst = spawn_rootfs(name);
     if (dst.empty())
         return EXIT_ROOTFS_COPY;
 
-    ChildArgs args{dst};
+    ChildArgs args{dst, cmd};
 
     pid_t pid = clone(child_fn, stack + sizeof(stack),
                       CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | SIGCHLD,
@@ -156,12 +181,21 @@ int hatch(const std::string& name, int mem_limit_mb) {
     int status;
     waitpid(pid, &status, 0);   // parent blocks until the creature exits
 
-    if (WIFSIGNALED(status))
-        fprintf(stderr, "creature went dormant (killed by signal %d)\n", WTERMSIG(status));
-    else if (WIFEXITED(status))
-        fprintf(stderr, "creature exited (status %d)\n", WEXITSTATUS(status));
+    // Was it the memory limit that killed it? Ask the cgroup, not the signal:
+    // a cgroup OOM-kill and an outside `kill -9` (how `release` stops a creature,
+    // since SIGTERM to a PID-namespace init is silently dropped) both show up as
+    // SIGKILL. oom_kill > 0 => it blew its limit => SLEEPING; otherwise RELEASED.
+    const char* final_status =
+        (read_oom_kill_count(cg) > 0) ? state::SLEEPING : state::RELEASED;
 
-    creature_set_status(cid, WIFSIGNALED(status) ? state::SLEEPING : state::RELEASED);
+    if (WIFSIGNALED(status))
+        fprintf(stderr, "creature stopped (signal %d) -> %s\n",
+                WTERMSIG(status), final_status);
+    else if (WIFEXITED(status))
+        fprintf(stderr, "creature exited (status %d) -> %s\n",
+                WEXITSTATUS(status), final_status);
+
+    creature_set_status(cid, final_status);
     db_close();
 
     rmdir(cg.c_str());                       // cgroup is empty now the child is gone

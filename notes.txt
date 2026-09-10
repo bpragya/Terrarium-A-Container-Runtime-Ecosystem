@@ -19,3 +19,11 @@ updating the database steps
 3) fill in the placehodler values in the object
 4) execute the statement
 5) free the object
+
+API - communication between frontend dashboard and binary/database via HTTP requests
+1) read the isolate binary (creates containers and updates database)
+2) read the database file
+
+GET - read al the animals from the database
+POST - hatch an animal and add it to the database
+DELETE - "kill" the animal :(

@@ -3,6 +3,11 @@ isolate
 *.o
 *.out
 
+# Python
+.venv/
+__pycache__/
+*.pyc
+
 # Editor / OS
 .vscode/
 .DS_Store
