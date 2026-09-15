@@ -79,18 +79,24 @@ def release(name: str) -> dict:
     if not rows:
         raise HTTPException(404, f"no creature named {name!r}")
     pid, status = rows[0]["pid"], rows[0]["status"]
-    if status != "ALIVE":
-        raise HTTPException(409, f"{name} is {status}, not ALIVE")
-    if not pid:
-        raise HTTPException(409, f"{name} has no pid yet")
-    try:
-        # SIGKILL, not SIGTERM: the creature's top process is PID 1 of its own
-        # PID namespace, and the kernel drops un-handled signals sent to a
-        # namespace init from outside — only SIGKILL/SIGSTOP force through.
-        # The launcher sees no cgroup OOM and records RELEASED.
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    if status not in ("ALIVE", "SLEEPING"):
+        raise HTTPException(409, f"{name} is {status}, not ALIVE or SLEEPING")
+    if pid:
+        try:
+            # SIGKILL, not SIGTERM: the creature's top process is PID 1 of its own
+            # PID namespace, and the kernel drops un-handled signals sent to a
+            # namespace init from outside — only SIGKILL/SIGSTOP force through.
+            # The launcher sees no cgroup OOM and records RELEASED.
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if status == "SLEEPING":
+        # A SLEEPING creature was already OOM-killed; its launcher already
+        # exited after recording that, so nothing is left running to react
+        # to the SIGKILL above and persist RELEASED — do it here instead.
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            conn.execute("UPDATE creatures SET status = 'RELEASED' WHERE name = ?", (name,))
+            conn.commit()
     return {"name": name, "status": "RELEASED"}
 
 
