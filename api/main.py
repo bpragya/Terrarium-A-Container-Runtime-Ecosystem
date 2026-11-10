@@ -90,13 +90,13 @@ def release(name: str) -> dict:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-    if status == "SLEEPING":
-        # A SLEEPING creature was already OOM-killed; its launcher already
-        # exited after recording that, so nothing is left running to react
-        # to the SIGKILL above and persist RELEASED — do it here instead.
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            conn.execute("UPDATE creatures SET status = 'RELEASED' WHERE name = ?", (name,))
-            conn.commit()
+    # Releasing removes the row so the name can be reused. If the creature was
+    # ALIVE, its launcher will still try to UPDATE this row's status after
+    # waitpid; that matches zero rows (ids are AUTOINCREMENT, never reused), so
+    # it can't touch a creature later hatched under the same name.
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("DELETE FROM creatures WHERE name = ?", (name,))
+        conn.commit()
     return {"name": name, "status": "RELEASED"}
 
 
